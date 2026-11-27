@@ -63,6 +63,11 @@ class SatelliteCamera:
     def with_params(self, **kw) -> "SatelliteCamera":
         return replace(self, **kw)
 
+    def rebase(self, h0: float) -> "SatelliteCamera":
+        """The same projection written with height datum h0: b absorbs lean * (h0 - self.h0)."""
+        d = float(h0) - self.h0
+        return replace(self, h0=float(h0), b_e=self.b_e + self.lean_e * d, b_n=self.b_n + self.lean_n * d)
+
     def to_dict(self) -> dict:
         return {k: (float(v) if isinstance(v, (float, np.floating)) else int(v) if isinstance(v, (int, np.integer))
                     else v) for k, v in asdict(self).items()}

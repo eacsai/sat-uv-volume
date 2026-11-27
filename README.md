@@ -1,13 +1,15 @@
 # sat-uv-volume
 
-Ground-truth **satellite UV volume** of one building, computed from a 3D mesh of the building.
+Ground-truth **satellite UV volume** of one building. The satellite camera is calibrated either from a 3D mesh of the
+building (method A) or from the UAV views of the same place (method B: e.g. the two UAV images of a CrossGeo pair);
+the UV volume itself is defined on a cube around the building.
 
 A UV volume (GenSfM / CUPID style, built on TRELLIS sparse structures) gives every voxel centre of a 64³ cube around the
 building the normalised image coordinate (u, v) it projects to, plus a mask saying whether it lands inside the image.
 For a satellite image this is not a plain orthographic projection: the image is a north-up map crop, but tall objects
 **lean** (their roofs are displaced horizontally in proportion to height). This repository models the satellite image
-as an affine "leaned" camera, calibrates that camera from the building mesh and the satellite image only, and writes
-the UV volume.
+as an affine "leaned" camera, calibrates that camera from the satellite image and either the building mesh or coloured
+UAV depth points, and writes the UV volume.
 
 ## Output format
 
@@ -37,6 +39,10 @@ CrossGeo pair (the mesh must be in the flight's world frame "EDS": x South, y Do
 
 ```
 python examples/crossgeo_satellite.py --pair-dir PAIR_DIR --mesh building.ply --out OUT --sat-sides 2 --figures
+# camera from the pair's own uav_1 + uav_2 instead of the mesh (the mesh then only places the cube):
+python examples/crossgeo_satellite.py --pair-dir PAIR_DIR --mesh building.ply --out OUT --method uav
+# both methods + satellite_<k>_compare.json + comparison figures:
+python examples/crossgeo_satellite.py --pair-dir PAIR_DIR --mesh building.ply --out OUT --compare --figures
 ```
 
 Writes `OUT/cube.json`, `OUT/occupancy.npy`, `OUT/satellite_<k>.npz`, `OUT/satellite_<k>_crop.png`,
@@ -56,6 +62,11 @@ win = window_around(cam, vertices, "eds")                                  # bui
 cube = cube_around(vertices, pad=1.1)
 vol = satellite_uv_volume(cam, win, cube, "eds", res=64)                   # uv_volume, ssuv, uv_raw, camera_cube
 occ = occupancy(vertices, faces, cube, 64)
+
+# method B: the same from UAV views (camera-Z depth, K on the depth grid, c2w with OpenCV axes, RGB)
+from sat_uv import UavView, uav_points, calibrate_satellite_uav
+P, rgb = uav_points([UavView(depth, K, c2w, image)], frame="eds", centre_en=(E_c, N_c), radius_m=80)
+res_b = calibrate_satellite_uav(image_rgb, cam0, P, rgb)                    # datum h0 = 5th percentile of the points
 ```
 
 ## Method (the experiment)
@@ -112,6 +123,16 @@ Unknown: b_e, b_n, lean_e, lean_n.
 Absolute scores are low (~0.2) because the image has many edges the building does not explain (ground texture, shadows,
 windows); what matters is the margin over lean = 0 and over the second-best peak.
 
+**5b. Calibration from UAV views** (`calibrate_satellite_uav`, defaults in `UavCalibConfig`; no mesh needed).
+1. Back-project each UAV depth map with its pose into coloured world points (`sat_uv/uav.py`; CrossGeo UAV depth is
+   camera-Z, pixel (r, c) looks along K⁻¹[c, r, 1]); keep the points within ±80 m (E, N) of the building.
+2. Datum h0 = 5th percentile of the points' heights (≈ local ground).
+3. For a candidate lean, project the points with b = 0 onto a 1 m working grid (UAV depth pixels are ~1–1.6 m on the
+   ground from 170–250 m); each cell keeps the colour of its **highest** point; one-cell gaps are filled from
+   neighbours. Cells without UAV data (occlusion, outside the views) are masked, and so is a 2-cell band around them.
+4. Score = masked normalised cross-correlation of the Sobel gradient of this predicted luminance with that of the
+   satellite image, over shifts of ±12 m (b); the lean search is the same as for the mesh.
+
 **6. UV volume.** Each voxel centre → world → pixel with the calibrated camera → window (u, v); mask on the unclamped
 values, then clamp.
 
@@ -155,6 +176,42 @@ lean 0. The v bands are slanted with the calibrated lean (higher voxels map furt
 the difference is the lean in the labels. The mask is 0 where voxels project outside the window.
 
 ![uv slice](docs/figures/satellite_2_4_uv_slice.png)
+
+## Mesh (A) vs the pair's two UAVs (B)
+
+Same pair, both satellite images. A = the stand-in mesh, which was reconstructed from the UAV depth of the **whole
+flight** (dense). B = only this pair's `uav_1` and `uav_2` (62,796 points within ±80 m of the tower). Numbers from
+`examples/crossgeo_satellite.py --compare`; the position gap is the distance in the satellite image between where the
+two cameras put the same mesh surface points (independent of the two datums); roof = top 2 % of heights (99 m),
+base = lowest 3 m.
+
+| satellite | method | lean (E, N) | NCC (own score) | NCC lean 0 | second peak | roof gap A–B | base gap A–B |
+|---|---|---|---|---|---|---|---|
+| 1 | A mesh edges | (−0.20, 0.62) | 0.210 | 0.063 | 0.120 | | |
+| 1 | B 2-UAV texture | (−0.18, 0.56) | 0.302 | 0.095 | 0.153 | 3.1 m | 4.1 m |
+| 2 | A mesh edges | (−0.20, 0.60) | 0.211 | 0.059 | 0.117 | | |
+| 2 | B 2-UAV texture | (−0.18, 0.54) | 0.310 | 0.098 | 0.150 | 4.1 m | 3.2 m |
+
+Cross scores (satellite 2): mesh-edge NCC 0.214 with camera A, 0.044 with camera B; 2-UAV-texture NCC 0.320 with camera
+B, 0.257 with camera A (satellite 1: 0.212 / 0.053 and 0.319 / 0.226). The two scores are different measures; compare
+within a row, not across. Run time: A 6.5 s, B 3.2 s per image (CPU).
+
+- **Lean agrees**: within 0.02 (E) and 0.06 (N) on both images; both peaks are clear (B's second peak 0.15 vs 0.30).
+- **Placement differs by 3–4 m** (b differs by (−2.8, 2.9) m and (−2.6, 1.9) m at the mesh datum).
+- **The geometry is the same**: the pair's UAV points lie on the mesh (roof points: median distance 0.10 m, 17,153
+  points; all points in the building box: 0.20 m). So the gap comes from the cue, not from the data.
+- **Appearance differs between the UAV views and the satellite image**: the UAV images are renders of a textured 3D
+  model whose imagery is of another date — e.g. the two low blocks have bare roofs in the UAV texture and solar panels
+  in the satellite image (`satellite_2_compare_2_uav_render.png`); and the two UAVs do not see the tower's south
+  facade (grey = no data). Matching colour gradients is affected by such changes; matching geometric edges (A) is not.
+- Visually the mesh outlines sit on the satellite's roof edges with camera A and ~3 m to the west with camera B
+  (`satellite_2_compare_1_edges.png`) — but that is A's own criterion. Without an independent ground truth this
+  comparison shows **agreement on lean and a 3–4 m disagreement on placement**, not which one is right. Not tested: a
+  B variant that matches the UAV points' height edges instead of their colour.
+
+![compare edges](docs/figures/satellite_2_compare_1_edges.png)
+![compare UAV render](docs/figures/satellite_2_compare_2_uav_render.png)
+![compare score maps](docs/figures/satellite_2_compare_3_score_maps.png)
 
 ## Hold-out check: does one building's camera fit its neighbours?
 
@@ -221,9 +278,11 @@ pytest -q
 
 Geo conversions and Mercator scale; camera axes, lean and offset signs, the 2×4 matrix in ENU and EDS; voxel layout,
 mask-before-clamp, satellite UV volume = camera projection and = `camera_cube`; occupancy; synthetic calibration
-(rendered boxes with known lean and b) recovers lean within 0.05 and b within 0.75 m; the CrossGeo reader. Each of eight
-code mutations (sign flips, lowest-wins rendering, mask after clamp, voxel centre offset, u/v swap, frame axis) makes a
-test fail.
+(rendered boxes with known lean and b) recovers lean within 0.05 and b within 0.75 m, for the mesh and for textured
+UAV points with an occlusion hole; UAV back-projection and pixel centre; masked NCC; scores independent of the datum;
+holes not scored; the CrossGeo readers, including a pose loader that refuses pickles naming other globals. Each of 17
+code mutations (sign flips, lowest-wins rendering, mask after clamp or ignored, voxel centre offset, u/v swap, frame
+axis, pixel centre, datum, pose guard) makes a test fail.
 
 ## Attribution
 

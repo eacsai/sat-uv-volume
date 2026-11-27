@@ -1,10 +1,15 @@
-"""Calibrate the satellite camera (ground offset b and lean) from a ground-truth mesh and the satellite image only.
+"""Calibrate the satellite camera (ground offset b and lean) from the satellite image and either
 
-For a candidate lean, points sampled densely on the mesh surface are projected with the camera (b = 0) onto a working
-grid; every grid cell keeps the highest point (seen from above, roofs hide what is below them). The edges of that
-predicted height image (and of its silhouette) are slid over the gradient magnitude of the satellite image by
-normalised cross-correlation (cv2.matchTemplate, TM_CCOEFF_NORMED) within +-b_max_m; the best shift is b, its score
-is the lean's score. Leans are searched on a coarse grid, then on a fine grid around the best one.
+- a mesh of the building (calibrate_satellite): for a candidate lean, points sampled densely on the mesh surface are
+  projected with the camera (b = 0) onto a working grid; every grid cell keeps the highest point (seen from above, roofs
+  hide what is below them). The edges of that predicted height image (and of its silhouette) are slid over the gradient
+  magnitude of the satellite image by normalised cross-correlation (cv2.matchTemplate, TM_CCOEFF_NORMED) within
+  +-b_max_m; the best shift is b, its score is the lean's score.
+- coloured UAV points (calibrate_satellite_uav, points from uav.uav_points): the same, but the predicted image is the
+  luminance of the highest UAV point of every cell (texture of roofs and ground, not only edges), and the correlation
+  counts only the cells the UAV views cover (masked NCC), so occlusion holes do not create false edges.
+
+Leans are searched on a coarse grid, then on a fine grid around the best one.
 """
 from __future__ import annotations
 
@@ -34,6 +39,14 @@ class CalibConfig:
     max_samples: int = 1_500_000
     second_min_dist: float = 0.25   # the reported second peak lies farther than this from the best coarse lean
     seed: int = 1111
+
+
+@dataclass
+class UavCalibConfig(CalibConfig):
+    work_m_per_px: float = 1.0      # UAV depth pixels are ~1 m on the ground from 150-250 m away
+    ground_percentile: float = 5.0  # datum h0 = this percentile of the UAV points' heights (when not given)
+    erode_px: int = 1               # covered cells within this distance of a hole are not scored
+    fill_min: float = 0.3           # an empty cell is filled from its 3x3 neighbours when they cover >= this fraction
 
 
 def sample_surface(vertices, faces, n: int, seed: int = 1111) -> np.ndarray:
@@ -76,11 +89,43 @@ def _parabola(cm: float, c0: float, cp: float) -> float:
     return float(np.clip(0.5 * (cm - cp) / d, -0.5, 0.5))
 
 
-class MeshEdgeRenderer:
-    """Predicted edge images of a mesh in a satellite image, on a working grid, and their match to the image."""
+def masked_ncc(I, T, M) -> np.ndarray:
+    """Normalised cross-correlation of template T over image I at every shift (shape (I.h - T.h + 1, I.w - T.w + 1),
+    like cv2.matchTemplate TM_CCOEFF_NORMED), counting only the template pixels where M > 0. -1 where undefined."""
+    I = np.asarray(I, np.float64)
+    m = np.asarray(M, np.float64) > 0
+    if m.sum() < 2:
+        return np.full((I.shape[0] - T.shape[0] + 1, I.shape[1] - T.shape[1] + 1), -1.0)
+    sd = I.std()
+    I = ((I - I.mean()) / (sd if sd > 0 else 1.0)).astype(np.float32)
+    Mf = m.astype(np.float32)
+    Tm = np.where(m, np.asarray(T, np.float64), 0.0)
+    n = float(m.sum())
+    t_mean = Tm.sum() / n
+    Tc = np.where(m, Tm - t_mean, 0.0).astype(np.float32)          # zero-mean template on the mask
+    sTT = float((Tc.astype(np.float64) ** 2).sum())
+    sI = cv2.matchTemplate(I, Mf, cv2.TM_CCORR).astype(np.float64)
+    sII = cv2.matchTemplate(I * I, Mf, cv2.TM_CCORR).astype(np.float64)
+    sIT = cv2.matchTemplate(I, Tc, cv2.TM_CCORR).astype(np.float64)
+    den = np.sqrt(np.maximum(sII - sI * sI / n, 0.0) * sTT)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = np.where(den > 1e-9, sIT / den, -1.0)
+    return out
 
-    def __init__(self, image_rgb, camera: SatelliteCamera, points_enu, cfg: CalibConfig | None = None):
-        self.cfg = cfg or CalibConfig()
+
+def _peak(S: np.ndarray) -> tuple:
+    """(value, row, col) of the maximum of S with sub-pixel parabola offsets."""
+    a, c = np.unravel_index(int(np.argmax(S)), S.shape)
+    da = _parabola(S[a - 1, c], S[a, c], S[a + 1, c]) if 0 < a < S.shape[0] - 1 else 0.0
+    dc = _parabola(S[a, c - 1], S[a, c], S[a, c + 1]) if 0 < c < S.shape[1] - 1 else 0.0
+    return float(S[a, c]), a + da, c + dc
+
+
+class _WorkGrid:
+    """The satellite image's gradient on a working grid of cfg.work_m_per_px, padded for shifts of +-b_max_m."""
+
+    def __init__(self, image_rgb, camera: SatelliteCamera, cfg: CalibConfig):
+        self.cfg = cfg
         self.cam = camera
         h, w = image_rgb.shape[:2]
         if (w, h) != (camera.width, camera.height):
@@ -96,6 +141,32 @@ class MeshEdgeRenderer:
         self.rs_y = int(round(self.cfg.b_max_m / self.my))
         py, px = self.pad + self.rs_y, self.pad + self.rs_x
         self.gpad = cv2.copyMakeBorder(self.grad, py, py, px, px, cv2.BORDER_CONSTANT, value=0)
+
+    def _cells(self, camera: SatelliteCamera, P) -> tuple:
+        col, row = camera.project_enu(P)
+        return np.floor(row * self.sy).astype(np.int64), np.floor(col * self.sx).astype(np.int64)
+
+    def _region(self, E, i0, j0, extra_y, extra_x):
+        a0 = i0 + self.pad + self.rs_y - extra_y
+        c0 = j0 + self.pad + self.rs_x - extra_x
+        if a0 < 0 or c0 < 0:
+            return None
+        reg = self.gpad[a0:a0 + E.shape[0] + 2 * extra_y, c0:c0 + E.shape[1] + 2 * extra_x]
+        if reg.shape != (E.shape[0] + 2 * extra_y, E.shape[1] + 2 * extra_x):
+            return None
+        return reg
+
+    def _shift(self, camera: SatelliteCamera) -> tuple:
+        """(dx, dy) working-grid pixels of camera's b, after writing it with this grid's datum."""
+        cam = camera.rebase(self.cam.h0)
+        return cam, cam.b_e / self.mx, -cam.b_n / self.my
+
+
+class MeshEdgeRenderer(_WorkGrid):
+    """Predicted edge images of a mesh in a satellite image, on a working grid, and their match to the image."""
+
+    def __init__(self, image_rgb, camera: SatelliteCamera, points_enu, cfg: CalibConfig | None = None):
+        super().__init__(image_rgb, camera, cfg or CalibConfig())
         self.P = np.asarray(points_enu, np.float64)
         self.h = self.P[:, 2] - camera.h0
         self.hmin = float(np.percentile(self.h, 1.0))
@@ -104,9 +175,7 @@ class MeshEdgeRenderer:
     def edges(self, lean_e: float, lean_n: float) -> tuple:
         """(E, i0, j0): the predicted edge image for this lean and b = 0; E[a, c] is working-grid pixel (i0 + a, j0 + c)."""
         cam = self.cam.with_params(b_e=0.0, b_n=0.0, lean_e=float(lean_e), lean_n=float(lean_n))
-        col, row = cam.project_enu(self.P)
-        i = np.floor(row * self.sy).astype(np.int64)
-        j = np.floor(col * self.sx).astype(np.int64)
+        i, j = self._cells(cam, self.P)
         i0, j0 = int(i.min()) - self.pad, int(j.min()) - self.pad
         hh, ww = int(i.max()) - i0 + self.pad + 1, int(j.max()) - j0 + self.pad + 1
         img = np.full(hh * ww, -np.inf)
@@ -120,33 +189,20 @@ class MeshEdgeRenderer:
         E = gradient_magnitude(R, self.cfg.blur_px) + gradient_magnitude(cov, self.cfg.blur_px)
         return E.astype(np.float32), i0, j0
 
-    def _region(self, E, i0, j0, extra_y, extra_x):
-        a0 = i0 + self.pad + self.rs_y - extra_y
-        c0 = j0 + self.pad + self.rs_x - extra_x
-        if a0 < 0 or c0 < 0:
-            return None
-        reg = self.gpad[a0:a0 + E.shape[0] + 2 * extra_y, c0:c0 + E.shape[1] + 2 * extra_x]
-        if reg.shape != (E.shape[0] + 2 * extra_y, E.shape[1] + 2 * extra_x):
-            return None
-        return reg
-
     def match(self, lean_e: float, lean_n: float) -> tuple:
         """(ncc, b_e, b_n) of the best shift of this lean's edges within +-b_max_m; ncc = -1 if out of the image."""
         E, i0, j0 = self.edges(lean_e, lean_n)
         reg = self._region(E, i0, j0, self.rs_y, self.rs_x)
         if reg is None or E.max() <= 0:
             return -1.0, 0.0, 0.0
-        S = cv2.matchTemplate(reg, E, cv2.TM_CCOEFF_NORMED)
-        a, c = np.unravel_index(int(np.argmax(S)), S.shape)
-        da = _parabola(S[a - 1, c], S[a, c], S[a + 1, c]) if 0 < a < S.shape[0] - 1 else 0.0
-        dc = _parabola(S[a, c - 1], S[a, c], S[a, c + 1]) if 0 < c < S.shape[1] - 1 else 0.0
-        dy, dx = a - self.rs_y + da, c - self.rs_x + dc
-        return float(S[a, c]), dx * self.mx, -dy * self.my
+        s, a, c = _peak(cv2.matchTemplate(reg, E, cv2.TM_CCOEFF_NORMED))
+        dy, dx = a - self.rs_y, c - self.rs_x
+        return s, dx * self.mx, -dy * self.my
 
     def score(self, camera: SatelliteCamera) -> float:
         """NCC of the edges of `camera` (its lean and its b, no search) against the image gradient."""
+        camera, dx, dy = self._shift(camera)
         E, i0, j0 = self.edges(camera.lean_e, camera.lean_n)
-        dx, dy = camera.b_e / self.mx, -camera.b_n / self.my
         reg = self._region(E, i0, j0, 0, 0)
         if reg is None or E.max() <= 0:
             return float("nan")
@@ -155,6 +211,7 @@ class MeshEdgeRenderer:
 
     def edge_pixels(self, camera: SatelliteCamera, percentile: float = 60.0) -> tuple:
         """(col, row) image-pixel coordinates of the strongest predicted edges of `camera` (for figures)."""
+        camera = camera.rebase(self.cam.h0)
         E, i0, j0 = self.edges(camera.lean_e, camera.lean_n)
         if not (E > 0).any():
             return np.zeros(0), np.zeros(0)
@@ -162,6 +219,104 @@ class MeshEdgeRenderer:
         col = (xx + j0 + 0.5) / self.sx + camera.b_e / camera.m_per_px
         row = (yy + i0 + 0.5) / self.sy - camera.b_n / camera.m_per_px
         return col, row
+
+
+class UavTextureRenderer(_WorkGrid):
+    """Predicted luminance of the satellite image from coloured UAV points (highest point of a cell wins), on a working
+    grid, and its masked match to the image's gradient (only cells covered by UAV points count)."""
+
+    def __init__(self, image_rgb, camera: SatelliteCamera, points_enu, rgb, cfg: UavCalibConfig | None = None):
+        super().__init__(image_rgb, camera, cfg or UavCalibConfig())
+        P = np.asarray(points_enu, np.float64)
+        if len(P) == 0:
+            raise ValueError("no UAV points")
+        h = P[:, 2] - camera.h0
+        o = np.argsort(h, kind="stable")                         # rank = index: higher points have higher ranks
+        self.P, self.h = P[o], h[o]
+        self.rgb = np.asarray(rgb, np.uint8)[o]
+        self.lum = luminance(self.rgb.astype(np.float32)[None])[0]
+        self.fill_k = np.ones((3, 3), np.float32) / 9.0
+
+    def _top(self, i, j, hh, ww):
+        """Index (rank) of the highest point of every cell, -1 where empty."""
+        best = np.full(hh * ww, -1, np.int64)
+        np.maximum.at(best, i * ww + j, np.arange(len(i), dtype=np.int64))
+        return best.reshape(hh, ww)
+
+    def _fill(self, vals, valid):
+        """Fill empty cells from their 3x3 neighbours (when they cover >= fill_min); returns (vals, valid)."""
+        v = valid.astype(np.float32)
+        den = cv2.filter2D(v, -1, self.fill_k, borderType=cv2.BORDER_CONSTANT)
+        if vals.ndim == 2:
+            num = cv2.filter2D(vals * v, -1, self.fill_k, borderType=cv2.BORDER_CONSTANT)
+        else:
+            num = np.stack([cv2.filter2D(vals[..., k] * v, -1, self.fill_k, borderType=cv2.BORDER_CONSTANT)
+                            for k in range(vals.shape[2])], -1)
+            den = den[..., None]
+        fill = (~valid) & (den.reshape(valid.shape) >= self.cfg.fill_min)
+        out = vals.copy()
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out[fill] = (num / np.maximum(den, 1e-6))[fill]
+        return out, valid | fill
+
+    def render(self, lean_e: float, lean_n: float) -> tuple:
+        """(L, valid, i0, j0): luminance of the highest UAV point per working-grid cell for this lean and b = 0."""
+        cam = self.cam.with_params(b_e=0.0, b_n=0.0, lean_e=float(lean_e), lean_n=float(lean_n))
+        i, j = self._cells(cam, self.P)
+        i0, j0 = int(i.min()) - self.pad, int(j.min()) - self.pad
+        hh, ww = int(i.max()) - i0 + self.pad + 1, int(j.max()) - j0 + self.pad + 1
+        best = self._top(i - i0, j - j0, hh, ww)
+        valid = best >= 0
+        L = np.zeros((hh, ww), np.float32)
+        L[valid] = self.lum[best[valid]]
+        L, valid = self._fill(L, valid)
+        return L, valid, i0, j0
+
+    def template(self, lean_e: float, lean_n: float) -> tuple:
+        """(T, M, i0, j0): gradient magnitude of the rendered luminance and the mask of cells that are scored."""
+        L, valid, i0, j0 = self.render(lean_e, lean_n)
+        T = gradient_magnitude(L, self.cfg.blur_px)
+        r = int(self.cfg.erode_px) + 1                          # the Sobel stencil reaches 1 cell into a hole
+        M = cv2.erode(valid.astype(np.uint8), np.ones((2 * r + 1, 2 * r + 1), np.uint8)) > 0
+        return T, M, i0, j0
+
+    def match(self, lean_e: float, lean_n: float) -> tuple:
+        """(ncc, b_e, b_n) of the best shift of this lean's predicted texture within +-b_max_m."""
+        T, M, i0, j0 = self.template(lean_e, lean_n)
+        reg = self._region(T, i0, j0, self.rs_y, self.rs_x)
+        if reg is None or M.sum() < 50:
+            return -1.0, 0.0, 0.0
+        s, a, c = _peak(masked_ncc(reg, T, M))
+        dy, dx = a - self.rs_y, c - self.rs_x
+        return s, dx * self.mx, -dy * self.my
+
+    def score(self, camera: SatelliteCamera) -> float:
+        """Masked NCC of `camera` (its lean and its b, no search) against the image gradient."""
+        camera, dx, dy = self._shift(camera)
+        T, M, i0, j0 = self.template(camera.lean_e, camera.lean_n)
+        reg = self._region(T, i0, j0, 0, 0)
+        if reg is None or M.sum() < 50:
+            return float("nan")
+        A = np.float32([[1, 0, dx], [0, 1, dy]])
+        Ts = cv2.warpAffine(T, A, (T.shape[1], T.shape[0]), flags=cv2.INTER_LINEAR)
+        Ms = cv2.warpAffine(M.astype(np.float32), A, (T.shape[1], T.shape[0]), flags=cv2.INTER_LINEAR) > 0.99
+        return float(masked_ncc(reg, Ts, Ms)[0, 0])
+
+    def predicted_rgb(self, camera: SatelliteCamera, window, size: int) -> tuple:
+        """(rgb [size, size, 3] uint8, valid [size, size]) of the UAV points seen through `camera` in a satellite window
+        resampled to size x size (highest point wins, small holes filled)."""
+        col, row = camera.project_enu(self.P)
+        u, v = window.uv(col, row)
+        i, j = np.floor(v * size).astype(np.int64), np.floor(u * size).astype(np.int64)
+        ok = (i >= 0) & (i < size) & (j >= 0) & (j < size)
+        best = np.full(size * size, -1, np.int64)
+        np.maximum.at(best, i[ok] * size + j[ok], np.nonzero(ok)[0])
+        best = best.reshape(size, size)
+        valid = best >= 0
+        img = np.zeros((size, size, 3), np.float32)
+        img[valid] = self.rgb[best[valid]]
+        img, valid = self._fill(img, valid)
+        return np.clip(img, 0, 255).astype(np.uint8), valid
 
 
 @dataclass
@@ -173,7 +328,7 @@ class CalibResult:
     second: dict                 # best coarse lean farther than second_min_dist from the best: {"ncc", "lean_e", "lean_n"}
     lean0: dict                  # lean = 0 with its own best b: {"ncc", "b_e", "b_n"}
     seconds: float
-    renderer: MeshEdgeRenderer = field(repr=False, default=None)
+    renderer: object = field(repr=False, default=None)   # MeshEdgeRenderer or UavTextureRenderer
 
     def summary(self) -> dict:
         return {"camera": self.camera.to_dict(), "ncc": self.ncc, "second_peak": self.second, "lean0": self.lean0,
@@ -191,6 +346,11 @@ def calibrate_satellite(image_rgb, camera: SatelliteCamera, vertices, faces, fra
     n = int(np.clip(mesh_area(V, faces) * cfg.samples_per_m2, cfg.min_samples, cfg.max_samples))
     pts = sample_surface(V, faces, n, cfg.seed)
     rend = MeshEdgeRenderer(image_rgb, camera, pts, cfg)
+    return _fit(rend, camera, cfg, t0)
+
+
+def _fit(rend, camera: SatelliteCamera, cfg: CalibConfig, t0: float) -> CalibResult:
+    """Coarse then fine lean search with rend.match; b of the best lean."""
     k = int(round(cfg.lean_max / cfg.lean_step))
     grid = np.round(np.arange(-k, k + 1) * cfg.lean_step, 6)
     coarse = np.full((len(grid), len(grid)), np.nan)
@@ -216,6 +376,21 @@ def calibrate_satellite(image_rgb, camera: SatelliteCamera, vertices, faces, fra
                        second={"ncc": float(sec[0]), "lean_e": float(sec[1]), "lean_n": float(sec[2])},
                        lean0={"ncc": float(s0), "b_e": float(be0), "b_n": float(bn0)},
                        seconds=time.time() - t0, renderer=rend)
+
+
+def calibrate_satellite_uav(image_rgb, camera: SatelliteCamera, points, rgb, frame: str = "enu",
+                            cfg: UavCalibConfig | None = None, h0: float | None = None) -> CalibResult:
+    """Fit b and lean of `camera` (width, height, m_per_px and centre are kept) to the satellite image using only
+    coloured UAV points (uav.uav_points). h0 None: the datum is the cfg.ground_percentile-th percentile of the points'
+    heights. The camera's own b and lean are not used as a prior."""
+    cfg = cfg or UavCalibConfig()
+    t0 = time.time()
+    P = to_enu(points, frame)
+    if h0 is None:
+        h0 = float(np.percentile(P[:, 2], cfg.ground_percentile))
+    camera = camera.with_params(h0=float(h0))
+    rend = UavTextureRenderer(image_rgb, camera, P, rgb, cfg)
+    return _fit(rend, camera, cfg, t0)
 
 
 def score_camera(image_rgb, camera: SatelliteCamera, vertices, faces, frame: str = "enu",

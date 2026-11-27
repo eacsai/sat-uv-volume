@@ -61,7 +61,7 @@ def edge_overlay(crop, window, col, row, rgb=(0, 255, 0)):
     return out
 
 
-def score_map(result, cell: int = 24, marks=()):
+def score_map(result, cell: int = 24, marks=(), title: str = "edge NCC vs lean: lean_e right, lean_n up"):
     """The coarse lean grid of a CalibResult, lean_e to the right, lean_n up; marks: (lean_e, lean_n, rgb) circles."""
     g = result.lean_grid
     s = np.flipud(result.coarse_ncc)
@@ -71,7 +71,7 @@ def score_map(result, cell: int = 24, marks=()):
     for le, ln, rgb in marks:
         cv2.circle(img, (int((le - g[0]) / step * cell + cell / 2), int((g[-1] - ln) / step * cell + cell / 2)), 8, rgb, 2)
     img = cv2.copyMakeBorder(img, 44, 8, 8, 8, cv2.BORDER_CONSTANT, value=(30, 30, 30))
-    label(img, "edge NCC vs lean: lean_e right, lean_n up", 18, 0.5)
+    label(img, title, 18, 0.5)
     label(img, "range %.2f .. %.2f" % (-g[-1], g[-1]), 38, 0.5)
     return img
 

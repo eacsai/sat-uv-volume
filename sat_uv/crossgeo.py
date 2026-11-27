@@ -1,18 +1,63 @@
-"""Reader of the satellite camera of one CrossGeo pair directory (pair_new layout: coords.json, ground_<k>_satellite.png).
+"""Readers of one CrossGeo pair directory (pair_new layout): the satellite cameras (coords.json, ground_<k>_satellite.png)
+and the UAV views (uav_<k>_depth.npy, uav_<k>_rgb.npy pose, uav_<k>_rgb.jpg).
 
 World frame of a flight: "EDS" (x South, y Down, z East, metres), a local tangent frame of WGS84 (checked on one HK
 flight: 96 records, rotation 0.002 deg, scale 0.999996, residual median 5 mm against lat/lon/alt).
 """
 from __future__ import annotations
 
+import io
 import json
 import os
+import pickle
 
 import cv2
 import numpy as np
+import numpy.lib.format as npf
 
 from .camera import SatelliteCamera
 from .geo import mercator_m_per_px
+from .uav import UavView
+
+_POSE_GLOBALS = {(m, n) for m in ("numpy.core.multiarray", "numpy._core.multiarray") for n in ("_reconstruct", "scalar")}
+_POSE_GLOBALS |= {("numpy", "ndarray"), ("numpy", "dtype")}
+
+
+class _PoseUnpickler(pickle.Unpickler):
+    """Unpickles numpy arrays and plain containers only."""
+
+    def find_class(self, module, name):
+        if (module, name) not in _POSE_GLOBALS:
+            raise pickle.UnpicklingError("pose file names a forbidden global %s.%s" % (module, name))
+        return super().find_class(module, name)
+
+
+def load_pose(path) -> tuple:
+    """(K 3x3, c2w 4x4) float64 of a CrossGeo pose .npy (a 0-d object array holding a dict with "intrinsics" and
+    "c2w"), read without executing arbitrary pickle code."""
+    with open(path, "rb") as f:
+        data = f.read()
+    f = io.BytesIO(data)
+    version = npf.read_magic(f)
+    _shape, _fortran, dtype = (npf.read_array_header_1_0 if version == (1, 0) else npf.read_array_header_2_0)(f)
+    if not dtype.hasobject:
+        raise ValueError("%s: not a pose file (dtype %s)" % (path, dtype))
+    arr = _PoseUnpickler(f).load()
+    m = arr.item() if isinstance(arr, np.ndarray) else arr
+    return np.asarray(m["intrinsics"], np.float64), np.asarray(m["c2w"], np.float64)
+
+
+def uav_views(pair_dir, names=("uav_1", "uav_2")) -> list:
+    """The UAV views of a pair: camera-Z depth [540, 960], K on the depth grid, c2w (EDS, OpenCV axes), RGB."""
+    out = []
+    for n in names:
+        K, c2w = load_pose(os.path.join(pair_dir, n + "_rgb.npy"))
+        depth = np.load(os.path.join(pair_dir, n + "_depth.npy"), allow_pickle=False).astype(np.float32)
+        bgr = cv2.imread(os.path.join(pair_dir, n + "_rgb.jpg"), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(os.path.join(pair_dir, n + "_rgb.jpg"))
+        out.append(UavView(depth=depth, K=K, c2w=c2w, rgb=np.ascontiguousarray(bgr[..., ::-1]), name=n))
+    return out
 
 
 def read_coords(pair_dir) -> dict:
