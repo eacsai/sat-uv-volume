@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sat-uv-volume"
+version = "0.1.0"
+description = "Ground-truth UV volumes (GenSfM / CUPID style) of satellite, UAV and street-level views of one building"
+requires-python = ">=3.8"
+dependencies = ["numpy", "opencv-python", "open3d"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["sat_uv"]
